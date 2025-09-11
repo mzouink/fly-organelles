@@ -1,6 +1,38 @@
 import torch
 import zarr
 import numpy as np
+import torch
+
+def f1_score(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    """
+    Compute F1 score for binary classification using PyTorch tensors.
+    
+    Args:
+        y_true (torch.Tensor): Ground truth labels (0 or 1), shape (N,)
+        y_pred (torch.Tensor): Predicted scores/probabilities or labels, shape (N,)
+        threshold (float): Threshold to convert probabilities to binary predictions
+
+    Returns:
+        float: F1 score
+    """
+    # # If predictions are probabilities, apply threshold
+    # if y_pred.dtype != torch.long and y_pred.dtype != torch.int:
+    #     y_pred = (y_pred >= threshold).long()
+
+    tp = (y_true * y_pred).sum().item()
+    fp = ((1 - y_true) * y_pred).sum().item()
+    fn = (y_true * (1 - y_pred)).sum().item()
+
+    if tp + fp == 0 or tp + fn == 0:
+        return 0.0  # avoid division by zero
+
+    precision = tp / (tp + fp)
+    recall = tp / (tp + fn)
+
+    if precision + recall == 0:
+        return 0.0
+
+    return 2 * (precision * recall) / (precision + recall)
 
 def balanced_accuracy(pred, label, eps=1e-7):
     """

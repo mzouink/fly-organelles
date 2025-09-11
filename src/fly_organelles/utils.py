@@ -12,11 +12,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def corner_offset(center_off_arr, raw_res_arr, crop_res_arr):
-    return np.round((center_off_arr + raw_res_arr / 2.0 - crop_res_arr / 2.0)/crop_res_arr)*crop_res_arr
-
 # def corner_offset(center_off_arr, raw_res_arr, crop_res_arr):
-#     return center_off_arr + raw_res_arr / 2.0 - crop_res_arr / 2.0
+#     return np.round((center_off_arr + raw_res_arr / 2.0 - crop_res_arr / 2.0)/crop_res_arr)*crop_res_arr
+
+def corner_offset(center_off_arr, raw_res_arr, crop_res_arr):
+    return center_off_arr + raw_res_arr / 2.0 - crop_res_arr / 2.0
 
 
 def valid_offset(center_off_arr, raw_res_arr, crop_res_arr):
@@ -109,6 +109,9 @@ class ShiftNorm(BatchFilter):
         # print(f"new min: {raw.data.min()}, new max: {raw.data.max()}")
 
 from edt import edt
+from gunpowder.array import Array
+from gunpowder.batch import Batch
+
 class Distance(gp.BatchFilter):
 
   def __init__(self, array,sigma=10.0):
@@ -116,17 +119,40 @@ class Distance(gp.BatchFilter):
     self.sigma = sigma
 
   def setup(self):
-    self.spec[self.array].dtype = np.float32
+    spec = self.spec[self.array].copy()
+    spec.dtype = "float32"
+    self.updates(self.array, spec)
+    self.enable_autoskip()
+
 
   def process(self, batch, request):
+    source = batch.arrays[self.array]
+    source_data = source.data
+    source_data = np.tanh((edt(source_data) - edt(source_data == 0)) / self.sigma)
+    source_data = (source_data+1)/2
 
-    data = batch[self.array].data
-    data = np.tanh((edt(data) - edt(data == 0)) / self.sigma)
-    batch[self.array].data = data.astype(np.float32)
+    cast_data = source_data.astype("float32")
+
+    target_spec = source.spec.copy()
+    target_spec.dtype = cast_data.dtype
+    target_array = Array(cast_data, target_spec)
+
+    # create output array
+    outputs = Batch()
+    outputs.arrays[self.array] = target_array
+
+    return outputs
+    
     
 class Binarize(BatchFilter):
     def __init__(self, array):
         self.array = array
+
+    def setup(self):
+        spec = self.spec[self.array].copy()
+        spec.dtype = "float32"
+        self.updates(self.array, spec)
+        self.enable_autoskip()
 
     def process(self, batch, request):
         if self.array not in batch.arrays:
@@ -136,7 +162,7 @@ class Binarize(BatchFilter):
         data = raw.data
         data[data > 0] = 1
         data[data < 1] = 0
-        raw.data = data
+        raw.data = data.astype(np.float32)
 
 
 class Distances(BatchFilter):
@@ -146,6 +172,9 @@ class Distances(BatchFilter):
         self.array = array
         self.norm = norm
         self.dt_scale_factor = dt_scale_factor
+
+    def setup(self):
+        self.spec[self.array].dtype = np.float32
 
     def process(self, batch, request):
         if self.array not in batch.arrays:
@@ -158,7 +187,7 @@ class Distances(BatchFilter):
             logger.debug(f"Computing distances for {raw.data.shape} with voxel size {voxel_size}")
 
             distances = self.compute_distance(raw.data, voxel_size, self.norm, self.dt_scale_factor)
-            raw.data = distances[0]
+            raw.data = distances[0].astype(np.float32)
 
     def compute_distance(
         self,

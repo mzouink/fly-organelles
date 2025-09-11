@@ -18,6 +18,8 @@ from fly_organelles.lsds.gp_node import LSDAffinities
 
 logger = logging.getLogger("__name__")
 
+def multi(arr):
+    return arr*255
 
 def sigmoidify(arr):
     return torch.nn.functional.sigmoid(torch.tensor(arr)).numpy()
@@ -154,17 +156,19 @@ def make_data_pipeline(
                 max_request=max_out_request,
             )
             src_pipe = src
-            # if src.needs_downsampling:
-            #     src_pipe += corditea.AverageDownSample(raw, sampling)
+            if src.needs_downsampling:
+                src_pipe += corditea.AverageDownSample(raw, sampling)
             probs.append(src.get_size() / len(ds_info["crops"]))
             logging.debug(f"Padding {crop} with {src.padding}")
             for label_key in label_keys.values():
+                # src_pipe += gp.AsType(label_key, "float32")
                 if distance_sigma is None:
                     src_pipe += Binarize(label_key)
                 else:
                     src_pipe+= Distance(label_key, sigma=distance_sigma)
+                src_pipe += gp.Pad(label_key, src.padding, value=255.0)
                 
-                src_pipe += gp.AsType(label_key, "float32")
+                
             factor = factors[src.specs[raw].dtype]
             # src_pipe += gp.Normalize(raw, factor=1.0 / factor)
             # src_pipe += gp.Normalize(raw, factor=1.0)
@@ -175,6 +179,7 @@ def make_data_pipeline(
 
             # src_pipe += gp.IntensityScaleShift(raw, scale=(maxc - minc) / factor, shift=minc / factor)
             src_pipe += gp.Pad(raw, None, value=0)
+            
             src_pipe += gp.RandomLocation()
             
             srcs.append(src_pipe)
@@ -182,6 +187,7 @@ def make_data_pipeline(
     pipeline = tuple(srcs) + gp.RandomProvider(probs)
     pipeline += gp.Unsqueeze(list(label_keys.values()))
     pipeline += corditea.Concatenate(list(label_keys.values()), all_labels_key)
+    pipeline += gp.AsType(all_labels_key, "float32")
     if min_mask is not None:
         pipeline += gp.Reject(all_labels_key,min_masked=min_mask)
     pipeline += gp.Pad(all_labels_key, src.padding, value=255)
@@ -253,29 +259,34 @@ def make_train_pipeline(
             min_mask=min_mask,
             distance_sigma = distance_sigma,
         )
-        loss_fn = WeightedMSELoss(foreground_factor=2)
+        loss_fn = MaskedMultiLabelBCEwithLogits(label_weights)
     pipeline += gp.PreCache(30, 20)
 
     
+    tr_node = gp.torch.Train(
+        model=model,
+        loss=loss_fn,
+        optimizer=torch.optim.Adam(lr=l_rate, params=model.parameters()),
+        # optimizer = torch.optim.AdamW(model.parameters(), lr=l_rate, weight_decay=1e-5),
+        inputs={"input": gp.ArrayKey("RAW")},
+        loss_inputs={"output": gp.ArrayKey("OUTPUT"), "target": gp.ArrayKey("LABELS"), "mask": gp.ArrayKey("MASK")},
+        outputs={0: gp.ArrayKey("OUTPUT")},
+        device="cuda",
+        log_every=100,
+        log_dir=log_dir,
+        save_every=10000,
+    )
+    # to force loading the latest checkpoint and continue
+    tr_node.start()
     
-    pipeline += gp.torch.Train(
-    model=model,
-    loss=loss_fn,
-    optimizer=torch.optim.Adam(lr=l_rate, params=model.parameters()),
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=l_rate, weight_decay=1e-5),
-    inputs={"raw": gp.ArrayKey("RAW")},
-    loss_inputs={"output": gp.ArrayKey("OUTPUT"), "target": gp.ArrayKey("LABELS"), "mask": gp.ArrayKey("MASK")},
-    outputs={0: gp.ArrayKey("OUTPUT")},
-    device="cuda",
-    log_every=20,
-    log_dir=log_dir,
-    save_every=2000,
-)
+    pipeline += tr_node
     
     pipeline += corditea.LambdaFilter(sigmoidify, gp.ArrayKey("OUTPUT"), gp.ArrayKey("NORM_OUTPUT"))
+    pipeline += corditea.LambdaFilter(multi, gp.ArrayKey("LABELS"), gp.ArrayKey("MULTI_LABELS"))
     snapshot_request = gp.BatchRequest()
     snapshot_request.add(gp.ArrayKey("DUMMY"), input_size, voxel_size=gp.Coordinate(sampling))
     snapshot_request.add(gp.ArrayKey("NORM_OUTPUT"), output_size, voxel_size=gp.Coordinate(sampling))
+    snapshot_request.add(gp.ArrayKey("MULTI_LABELS"), output_size, voxel_size=gp.Coordinate(sampling))
     del snapshot_request[gp.ArrayKey("DUMMY")]
     pipeline += gp.Snapshot(
         {
@@ -284,9 +295,10 @@ def make_train_pipeline(
             gp.ArrayKey("MASK"): "mask",
             gp.ArrayKey("OUTPUT"): "output",
             gp.ArrayKey("NORM_OUTPUT"): "norm_output",
+            gp.ArrayKey("MULTI_LABELS"): "multi_labels",
         },
         output_filename="{iteration:08d}.zarr",
-        every=500,
+        every=2000,
         additional_request=snapshot_request,
     )
     return pipeline

@@ -44,10 +44,20 @@ def detect_crops_from_gt_pattern(gt_pattern):
 
     return sorted(crops_found)
 
-def create_yaml_with_crops(input_yaml_path, output_yaml_path):
+def check_is_positive(crop_gt_path):
+    import zarr
+    z = zarr.open(crop_gt_path, mode='r')["s0"]
+    if z[:].any():
+        return True
+    return False
+
+def create_yaml_with_crops(input_data, output_yaml_path,positive_only=False, organelle = None):
     result = {}
-    with open(input_yaml_path, 'r') as f:
-        data = yaml.safe_load(f)
+    if isinstance(input_data, str) or isinstance(input_data, os.PathLike):
+        with open(input_data, 'r') as f:
+            data = yaml.safe_load(f)
+    else:
+        data = input_data
 
     if 'datasets' not in data or not isinstance(data['datasets'], dict):
         raise ValueError("The input YAML must have a top-level 'datasets' dictionary.")
@@ -65,7 +75,20 @@ def create_yaml_with_crops(input_yaml_path, output_yaml_path):
         
             for crop in crops_found:
                 crop_gt_path = gt_pattern.replace('[CROP]', crop)
+                if positive_only:
+                    if organelle is None:
+                        raise ValueError("organelle must be specified when positive_only is True")
+                    t_org_path = os.path.join(crop_gt_path, organelle)
+                    if not os.path.exists(t_org_path):
+                        print(f"Warning: Crop path {t_org_path} does not exist.")
+                        continue
+                    if not check_is_positive(t_org_path):
+                        print(f"Skipping negative crop: {t_org_path}")
+                        continue
                 result[dataset_name]["crops"][crop] = crop_gt_path
+            if result[dataset_name]["crops"] == {}:
+                del result[dataset_name]
+            
 
     result = {"datasets": result}
     print(result)
