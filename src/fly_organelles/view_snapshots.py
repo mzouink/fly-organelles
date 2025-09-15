@@ -16,8 +16,8 @@ def create_lv(path, volume_type="segmentation", array_name="raw"):
 
     dim_names = ["z", "y", "x", "c", "n"]
     dim_units = ["nm", "nm", "nm", "", ""]
-    dim_scales = [*z_arr.attrs["resolution"], 1, 1]
-    voxel_offset = [*(np.array(z_arr.attrs["offset"]) / np.array(z_arr.attrs["resolution"])), 0, 0]
+    dim_scales = [*z_arr.attrs["voxel_size"], 1, 1]
+    voxel_offset = [*(np.array(z_arr.attrs["offset"]) / np.array(z_arr.attrs["voxel_size"])), 0, 0]
     for dim in range(arr.ndim)[::-1]:
         if arr.shape[dim] == 1:
             arr = dask.array.squeeze(arr, axis=dim)
@@ -34,6 +34,7 @@ def add_example_layers(state, snapshot_path, *, add_time=True):
         "raw": "image",
         "output": "image",
         "norm_output": "image",
+        "multi_labels": "image",
         "labels": "segmentation",
         "mask": "segmentation",
     }
@@ -64,8 +65,8 @@ def create_lv_stacked(snapshot_path, volume_type="segmentation", array_name="raw
     dask_arrs = dask.array.stack(dask_arrs, axis=-1)
     dim_names = ["z", "y", "x", "c", "n", "t"]
     dim_units = ["nm", "nm", "nm", "", "", "s"]
-    dim_scales = [*z_arr.attrs["resolution"], 1, 1, 1]
-    voxel_offset = [*(np.array(z_arr.attrs["offset"]) / np.array(z_arr.attrs["resolution"])), 0, 0, 0]
+    dim_scales = [*z_arr.attrs["voxel_size"], 1, 1, 1]
+    voxel_offset = [*(np.array(z_arr.attrs["offset"]) / np.array(z_arr.attrs["voxel_size"])), 0, 0, 0]
     for dim in range(dask_arrs.ndim)[::-1]:
         if dask_arrs.shape[dim] == 1:
             dask_arrs = dask.array.squeeze(dask_arrs, axis=dim)

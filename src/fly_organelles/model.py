@@ -76,6 +76,7 @@ class WeightedMSELoss(torch.nn.MSELoss):
 
         return loss
     
+    
 class MaskedMultiLabelBCEwithLogits(torch.nn.BCEWithLogitsLoss):
     def __init__(self, pos_weight, spatial_dims=3):
         pos_weight = torch.Tensor(pos_weight)[(...,) + (None,) * spatial_dims]
@@ -135,6 +136,6 @@ class StandardUnet(torch.nn.Module):
 
         self.final_conv = torch.nn.Conv3d(num_fmaps, out_channels, (1, 1, 1), padding="valid")
 
-    def forward(self, raw):
-        x = self.unet_backbone(raw)
+    def forward(self, input):
+        x = self.unet_backbone(input)
         return self.final_conv(x)
