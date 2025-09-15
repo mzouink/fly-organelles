@@ -50,6 +50,51 @@ def read_data_yaml(yaml_file: BinaryIO):
                 crop_copies.append(len(copies))
     return label_stores, raw_stores, crop_copies
 
+from fly_organelles.anistropic_utils import (
+    change_multiscale_name,
+    get_axes_object,
+    infer_nominal_transform,
+    get_downsampling_factors,
+    generate_standard_multiscale,
+)
+def get_nominal_attrs(raw_zarr_grp):
+        # check raw data to see if it is isotropic
+        offsets, samplings, _ = get_scale_info(raw_zarr_grp)
+        sampling = next(iter(samplings.values()))
+        isotropic = len(set(sampling)) == 1
+        attrs = raw_zarr_grp.attrs.asdict()
+        if isotropic:
+            change_multiscale_name(attrs, "nominal")
+        else:
+            change_multiscale_name(attrs, "estimated")
+            axes = get_axes_object(raw_zarr_grp)
+            dataset_paths = sorted(samplings.keys(), key=lambda x: min(samplings[x]))
+            nominal_scale, nominal_offset = infer_nominal_transform(
+                samplings[dataset_paths[0]], offsets[dataset_paths[0]]
+            )
+            factors = get_downsampling_factors(samplings)
+            ms_nominal = generate_standard_multiscale(
+                dataset_paths=dataset_paths,
+                axes=axes,
+                base_resolution=nominal_scale,
+                base_offset=nominal_offset,
+                factors=factors,
+            )
+            attrs["multiscales"] = [ms_nominal.model_dump()]
+        return attrs
+
+def get_nominal_scale_info(zarr_grp):
+    attrs = get_nominal_attrs(zarr_grp)
+    resolutions = {}
+    offsets = {}
+    shapes = {}
+    # making a ton of assumptions here, hopefully triggering KeyErrors though if they don't apply
+    for scale in attrs["multiscales"][0]["datasets"]:
+        resolutions[scale["path"]] = scale["coordinateTransformations"][0]["scale"]
+        offsets[scale["path"]] = scale["coordinateTransformations"][1]["translation"]
+        shapes[scale["path"]] = zarr_grp[scale["path"]].shape
+    return offsets, resolutions, shapes
+
 
 def get_scale_info(zarr_grp):
     attrs = zarr_grp.attrs
@@ -66,7 +111,7 @@ def get_scale_info(zarr_grp):
 
 
 def find_target_scale_by_offset(zarr_grp, offset):
-    offsets, resolutions, shapes = get_scale_info(zarr_grp)
+    offsets, resolutions, shapes = get_nominal_scale_info(zarr_grp)
     target_scale = None
     for scale, res in list(resolutions.items())[::-1]:
         if gp.Coordinate(offset) % gp.Coordinate(res) == gp.Coordinate((0,) * len(offset)):
@@ -79,7 +124,7 @@ def find_target_scale_by_offset(zarr_grp, offset):
 
 
 def find_target_scale(zarr_grp, target_resolution):
-    offsets, resolutions, shapes = get_scale_info(zarr_grp)
+    offsets, resolutions, shapes = get_nominal_scale_info(zarr_grp)
     target_scale = None
     for scale, res in resolutions.items():
         if gp.Coordinate(res) == gp.Coordinate(target_resolution):

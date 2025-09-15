@@ -73,7 +73,14 @@ def get_local_shape_descriptors(
     if labels is None:
         labels = np.unique(segmentation)
 
+    # prepare full-res descriptor volumes for roi
+    # channels = 10 if dims == 3 else 6
+    # descriptors = np.zeros((channels,) + segmentation.shape, dtype=np.float32)
+
+    # get sub-sampled shape, roi, voxel size and sigma
     df = downsample
+    logger.debug("Downsampling segmentation %s with factor %f", segmentation.shape, df)
+
     segmentation = segmentation[tuple(slice(None, None, df) for _ in range(dims))]
 
     sub_shape = segmentation.shape
@@ -88,16 +95,20 @@ def get_local_shape_descriptors(
         indexing="ij",
     )
     coords = np.array(grid, dtype=np.float32)
+
+    # normalize stats
+    # get max possible mean offset for normalization
+    # farthest voxel in context is 3*sigma away, but due to Gaussian
+    # weighting, sigma itself is probably a better upper bound
     max_distance = np.array([s for s in sigma], dtype=np.float32)
 
+    # for all labels
     label_descriptors = []
     for label in labels:
         if label == 0:
             continue
-        mask: np.ndarray = segmentation == label
-        if not np.any(mask):
-            continue
 
+        mask: np.ndarray = segmentation == label
         masked_coords = coords * mask
 
         aggregate = functools.partial(
@@ -107,11 +118,24 @@ def get_local_shape_descriptors(
             truncate=3.0,
         )
 
-        mass = aggregate(mask.astype(np.float32), sigma=sub_sigma_voxel)
+        # simply a mask convolved with a Gaussian
+        mass = aggregate(
+            mask.astype(np.float32),
+            sigma=sub_sigma_voxel,
+        )
+
+        # offsets (meshgrid convolved with Gaussian, divided by mass, minus meshgrid)
         center_of_mass = (
             np.array(
-                [aggregate(masked_coords[d], sigma=sub_sigma_voxel) for d in range(dims)]
-            ) / mass
+                [
+                    aggregate(
+                        masked_coords[d],
+                        sigma=sub_sigma_voxel,
+                    )
+                    for d in range(dims)
+                ]
+            )
+            / mass
         )
         mean_offset = center_of_mass - coords
         mean_offset = (
@@ -119,11 +143,15 @@ def get_local_shape_descriptors(
         )
         mean_offset *= mask
 
+        # covariance
         coords_outer = outer_product(masked_coords)
         center_of_mass_outer = outer_product(center_of_mass)
 
+        # get indices of upper triangle of covariance matrix
         rows, cols = np.triu_indices(dims)
         entries = (rows * dims + cols).tolist()
+
+        # sort them s.t. the diagonal entries come first. the first `dims` are the diagonals
         entries = sorted(
             entries, key=lambda x: x % (dims + 1) * (dims + 1) + x // (dims + 1)
         )
@@ -138,19 +166,15 @@ def get_local_shape_descriptors(
             covariance[ind] /= sigma[x] * sigma[y]
 
         descriptor = np.concatenate((mean_offset, covariance, mass[None, :]))
+
         mask = mask[None][[0] * descriptor.shape[0], ...]
         masked_descriptor = np.zeros_like(descriptor)
         masked_descriptor[mask] = descriptor[mask]
         label_descriptors.append(masked_descriptor)
 
-    if not label_descriptors:
-        logger.warning("No non-zero or valid labels found in segmentation.")
-        channels = 10 if dims == 3 else 6  # Adjust based on expected output
-        empty_shape = (channels,) + segmentation.shape
-        return np.zeros(empty_shape, dtype=np.float32)
-
-    descriptors = np.sum(np.array(label_descriptors, dtype=np.float32), axis=0)
-    descriptors = np.clip(descriptors, 0.0, 1.0)
+    descriptors = np.sum(np.array(label_descriptors), axis=0)
+    # clip outliers
+    np.clip(descriptors, 0.0, 1.0, out=descriptors)
 
     return upsample(descriptors, df)
 

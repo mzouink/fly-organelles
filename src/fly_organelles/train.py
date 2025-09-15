@@ -40,12 +40,9 @@ def make_affinities_data_pipeline(
 ):
     raw = gp.ArrayKey("RAW")
     all_labels_key = gp.ArrayKey("LABELS")
-    
     label_keys = {}
     for label in labels:
         label_keys[label] = gp.ArrayKey(label.upper())
-    
-    
     srcs = []
     probs = []
     factors = {
@@ -55,7 +52,6 @@ def make_affinities_data_pipeline(
     }
     for dataset, ds_info in datasets["datasets"].items():
         for crop in ds_info["crops"]:
-            # for crop in crops.split(","):
             src = CellMapCropSource(
                 ds_info["crops"][crop],
                 ds_info["raw"],
@@ -69,8 +65,19 @@ def make_affinities_data_pipeline(
             if src.needs_downsampling:
                 src_pipe += corditea.AverageDownSample(raw, sampling)
             probs.append(src.get_size() / len(ds_info["crops"]))
-            # logging.debug(f"Padding {crop} with {src.padding}")
-
+            logging.debug(f"Padding {crop} with {src.padding}")
+            for label_key in label_keys.values():
+                # src_pipe += gp.AsType(label_key, "float32")
+                src_pipe+= LSDAffinities(
+                    label_key,
+                    affinities=affinities_map,
+                    )
+                src_pipe += gp.Pad(label_key, src.padding, value=255.0)
+                
+                
+            factor = factors[src.specs[raw].dtype]
+            # src_pipe += gp.Normalize(raw, factor=1.0 / factor)
+            # src_pipe += gp.Normalize(raw, factor=1.0)
             minc, maxc = ds_info["contrast"]
             src_pipe+= gp.AsType(raw, "float32")
             src_pipe+= ShiftNorm(raw, minc, maxc)
@@ -78,21 +85,18 @@ def make_affinities_data_pipeline(
 
             # src_pipe += gp.IntensityScaleShift(raw, scale=(maxc - minc) / factor, shift=minc / factor)
             src_pipe += gp.Pad(raw, None, value=0)
+            
             src_pipe += gp.RandomLocation()
-
+            
             srcs.append(src_pipe)
-
-    pipeline = tuple(srcs) + gp.RandomProvider(probs)
     
-    for label_key in label_keys.values():
-        if min_mask is not None:
-            pipeline += gp.Reject(label_key,min_masked=min_mask)
-        pipeline += LSDAffinities(
-            label_key,
-            affinities=affinities_map,
-            )
-    src_pipe += gp.AsType(label_key, "float32")
-    src_pipe += gp.Pad(label_key, src.padding, value=255.0)
+    pipeline = tuple(srcs) + gp.RandomProvider(probs)
+    # pipeline += gp.Unsqueeze(list(label_keys.values()))
+    pipeline += corditea.Concatenate(list(label_keys.values()), all_labels_key)
+    pipeline += gp.AsType(all_labels_key, "float32")
+    if min_mask is not None:
+        pipeline += gp.Reject(all_labels_key,min_masked=min_mask)
+    pipeline += gp.Pad(all_labels_key, src.padding, value=255)
     pipeline += gp.IntensityAugment(raw, 0.75, 1.5, -0.15, 0.15)
     pipeline += corditea.GammaAugment([raw], 0.75, 4 / 3.0)
     pipeline += gp.SimpleAugment()
@@ -106,19 +110,15 @@ def make_affinities_data_pipeline(
     )
     pipeline += gp.IntensityScaleShift(raw, 2, -1)
     pipeline += corditea.GaussianNoiseAugment(raw, var_range=(0, 0.01), noise_prob=0.5)
-    # pipeline += gp.Unsqueeze(list(affinities_keys.values()))
-    pipeline += corditea.Concatenate(list(label_keys.values()), all_labels_key)
+
     
-    pipeline += gp.Pad(all_labels_key, src.padding, value=255)
-    # pipeline += gp.BalanceLabels(
-    #     all_labels_key,
-    #     gp.ArrayKey("MASK"))
     pipeline += ExtractMask(all_labels_key, gp.ArrayKey("MASK"))
     pipeline += gp.Unsqueeze([raw])
     pipeline += gp.Stack(batch_size)
     pipeline += gp.AsType(all_labels_key, "float32")
 
     return pipeline
+
 
 
 def make_data_pipeline(
@@ -272,7 +272,7 @@ def make_train_pipeline(
         loss_inputs={"output": gp.ArrayKey("OUTPUT"), "target": gp.ArrayKey("LABELS"), "mask": gp.ArrayKey("MASK")},
         outputs={0: gp.ArrayKey("OUTPUT")},
         device="cuda",
-        log_every=100,
+        log_every=10,
         log_dir=log_dir,
         save_every=10000,
     )
