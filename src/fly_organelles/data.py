@@ -11,7 +11,8 @@ from fly_organelles.utils import (
     corner_offset,
     find_target_scale,
     find_target_scale_by_offset,
-    get_scale_info,
+    # get_nominal_scale_info,
+    get_nominal_scale_info,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ class CellMapCropSource(gp.batch_provider.BatchProvider):
         raw_grp = fst.read(raw_store)
         raw_scale, raw_offset, raw_shape = find_target_scale(raw_grp, sampling)
         raw_offset = gp.Coordinate((0,) * len(sampling))  # tuple(np.array(raw_offset) - np.array(sampling)/2.)
-        raw_native_scale = get_scale_info(raw_grp)[1]["s0"]
+        raw_native_scale = get_nominal_scale_info(raw_grp)[1]["s0"]
         self.stores[raw_arraykey] = fst.read(Path(raw_store) / raw_scale)
         self.labels = labels
         raw_roi = gp.Roi(raw_offset, gp.Coordinate(sampling) * gp.Coordinate(raw_shape))

@@ -1,22 +1,22 @@
-from funlib.geometry import Coordinate
-import numpy as np
-import logging
-from scipy.ndimage import convolve, gaussian_filter
-from numpy.lib.stride_tricks import as_strided
-
-from collections.abc import Sequence
-import torch
 import functools
+import logging
+from collections.abc import Sequence
+
+import numpy as np
+from funlib.geometry import Coordinate
+from numpy.lib.stride_tricks import as_strided
+from scipy.ndimage import convolve, gaussian_filter
 
 logger = logging.getLogger(__name__)
 
 
-def get_local_shape_descriptors(
+def get_lsds(
     segmentation: np.ndarray,
-    sigma: float | Sequence[float],
+    sigma: float | Sequence[float] = 8,
     voxel_size: Sequence[int] | None = None,
     labels: Sequence[int] | None = None,
     downsample: int = 1,
+    use_paper_ordering: bool = True,
 ):
     """
     Compute local shape descriptors for the given segmentation.
@@ -46,9 +46,12 @@ def get_local_shape_descriptors(
             faster processing. Defaults to 1 (no downsampling).
     """
 
+    if sigma is None:
+        logger.warning("No sigma provided, defaulting to 8.")
+        sigma = 8
+
     assert all([(s // downsample) * downsample == s for s in segmentation.shape]), (
-        f"Segmentation shape {segmentation.shape} must be divisible by "
-        f"downsample factor {downsample}."
+        f"Segmentation shape {segmentation.shape} must be divisible by " f"downsample factor {downsample}."
     )
 
     dims = len(segmentation.shape)
@@ -56,8 +59,7 @@ def get_local_shape_descriptors(
         sigma = (sigma,) * dims
 
     assert len(sigma) == dims, (
-        f"Sigma {sigma} must have the same number of dimensions as "
-        f"segmentation. shape: {segmentation.shape}."
+        f"Sigma {sigma} must have the same number of dimensions as " f"segmentation. shape: {segmentation.shape}."
     )
 
     if voxel_size is None:
@@ -81,17 +83,14 @@ def get_local_shape_descriptors(
     df = downsample
     logger.debug("Downsampling segmentation %s with factor %f", segmentation.shape, df)
 
-    segmentation = segmentation[tuple(slice(None, None, df) for _ in range(dims))]
+    sub_segmentation = segmentation[tuple(slice(None, None, df) for _ in range(dims))]
 
-    sub_shape = segmentation.shape
+    sub_shape = sub_segmentation.shape
     sub_voxel_size = tuple(v * df for v in voxel_size)
     sub_sigma_voxel = tuple(s / v for s, v in zip(sigma, sub_voxel_size))
 
     grid = np.meshgrid(
-        *[
-            np.arange(0, sub_shape[dim] * sub_voxel_size[dim], sub_voxel_size[dim])
-            for dim in range(dims)
-        ],
+        *[np.arange(0, sub_shape[dim] * sub_voxel_size[dim], sub_voxel_size[dim]) for dim in range(dims)],
         indexing="ij",
     )
     coords = np.array(grid, dtype=np.float32)
@@ -108,8 +107,8 @@ def get_local_shape_descriptors(
         if label == 0:
             continue
 
-        mask: np.ndarray = segmentation == label
-        masked_coords = coords * mask
+        sub_mask: np.ndarray = sub_segmentation == label
+        masked_coords = coords * sub_mask
 
         aggregate = functools.partial(
             gaussian_filter,
@@ -120,11 +119,14 @@ def get_local_shape_descriptors(
 
         # simply a mask convolved with a Gaussian
         mass = aggregate(
-            mask.astype(np.float32),
+            sub_mask.astype(np.float32),
             sigma=sub_sigma_voxel,
         )
+        mass_mask = mass == 0
+        mass[mass_mask] = 1
 
-        # offsets (meshgrid convolved with Gaussian, divided by mass, minus meshgrid)
+        # offsets (meshgrid convolved with Gaussian, divided by mass, minus
+        # meshgrid)
         center_of_mass = (
             np.array(
                 [
@@ -138,10 +140,7 @@ def get_local_shape_descriptors(
             / mass
         )
         mean_offset = center_of_mass - coords
-        mean_offset = (
-            mean_offset / max_distance.reshape((-1,) + (1,) * dims) * 0.5 + 0.5
-        )
-        mean_offset *= mask
+        mean_offset = mean_offset / max_distance.reshape((-1,) + (1,) * dims) * 0.5 + 0.5
 
         # covariance
         coords_outer = outer_product(masked_coords)
@@ -151,32 +150,44 @@ def get_local_shape_descriptors(
         rows, cols = np.triu_indices(dims)
         entries = (rows * dims + cols).tolist()
 
-        # sort them s.t. the diagonal entries come first. the first `dims` are the diagonals
-        entries = sorted(
-            entries, key=lambda x: x % (dims + 1) * (dims + 1) + x // (dims + 1)
-        )
-        covariance = (
-            np.array([aggregate(coords_outer[d], sub_sigma_voxel) for d in entries])
-            / mass
-        )
+        # sort them s.t. the diagonal entries come first. the first `dims` are
+        # the diagonals
+        entries = sorted(entries, key=lambda x: x % (dims + 1) * (dims + 1) + x // (dims + 1))
+
+        covariance = np.array([aggregate(coords_outer[d], sub_sigma_voxel) for d in entries]) / mass
         covariance -= center_of_mass_outer[entries]
 
-        for ind, entry in enumerate(entries):
-            x, y = entry // dims, entry % dims
-            covariance[ind] /= sigma[x] * sigma[y]
+        # normalize variance and pearson correlations
+        variance = covariance[:dims]  # diagonals
+        variance = np.maximum(variance, 1e-3)  # avoid division by zero
 
-        descriptor = np.concatenate((mean_offset, covariance, mass[None, :]))
+        # normalize pearson coefficients by axis variance
+        # also divide by 2 and add 0.5 to get them into [0, 1]
+        pearson = covariance[dims:]  # off-diagonals
+        for ind, entry in enumerate(entries[dims:]):
+            i, j = entry // dims, entry % dims
+            pearson[ind] /= 2 * np.sqrt(variance[i] * variance[j])
+            pearson[ind] += 0.5
 
-        mask = mask[None][[0] * descriptor.shape[0], ...]
-        masked_descriptor = np.zeros_like(descriptor)
-        masked_descriptor[mask] = descriptor[mask]
-        label_descriptors.append(masked_descriptor)
+        # normalize variance by axis sigma
+        for d in range(dims):
+            variance[d] /= sigma[d] ** 2
+
+        # reset 0 mass regions (this was set to 1 above to avoid nans)
+        mass = mass * ~mass_mask
+
+        if dims == 3 and use_paper_ordering:
+            # rearrange for backwards compatibility
+            pearson = pearson[[0, 2, 1]]
+
+        descriptor = np.concatenate((mean_offset, variance, pearson, mass[None, :]))
+        descriptor = upsample(descriptor, df)
+        label_descriptors.append(descriptor * (segmentation == label)[None, ...])
 
     descriptors = np.sum(np.array(label_descriptors), axis=0)
-    # clip outliers
     np.clip(descriptors, 0.0, 1.0, out=descriptors)
 
-    return upsample(descriptors, df)
+    return descriptors
 
 
 def outer_product(array):
@@ -207,3 +218,38 @@ def upsample(array, f):
     [ll.append(shape[i + 1] * f) for i, j in enumerate(shape[1:])]
 
     return view.reshape(ll)
+
+
+def deriv_based_covariance(sub_voxel_size, mass, sub_sigma_voxel):
+    """
+    Instead of using an inner product to compute covariance, we could
+    take derivatives. Might be more efficient but seems harder to normalize
+    appropriately between small and large objects.
+    """
+    k_y = np.zeros((3, 1), dtype=np.float32)
+    k_y[0, 0] = sub_voxel_size[0]
+    k_y[2, 0] = -sub_voxel_size[0]
+
+    k_x = np.zeros((1, 3), dtype=np.float32)
+    k_x[0, 0] = sub_voxel_size[1]
+    k_x[0, 2] = -sub_voxel_size[1]
+
+    # first derivatives
+    d_y = convolve(mass, k_y, mode="constant")
+    d_x = convolve(mass, k_x, mode="constant")
+
+    # second derivatives
+    d_yy = convolve(d_y, k_y, mode="constant")
+    d_xx = convolve(d_x, k_x, mode="constant")
+    d_yx = convolve(d_y, k_x, mode="constant")
+
+    norm = 1
+    d_y *= norm * sub_sigma_voxel[0]
+    d_x *= norm * sub_sigma_voxel[1]
+
+    d_yy *= norm * sub_sigma_voxel[0] ** 2
+    d_xx *= norm * sub_sigma_voxel[1] ** 2
+    d_yx *= norm * sub_sigma_voxel[0] * sub_sigma_voxel[1]
+
+    _mean_offset = np.stack([d_y, d_x]) * 0.5 + 0.5
+    _covariance = np.stack([d_yy, d_xx, d_yx]) * 0.5 + 0.5
