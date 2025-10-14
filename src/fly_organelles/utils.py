@@ -1,5 +1,6 @@
 import itertools
 import os
+import fibsem_tools as fst
 from typing import BinaryIO
 from funlib.geometry import Coordinate
 from scipy.ndimage.morphology import distance_transform_edt
@@ -14,6 +15,41 @@ logger = logging.getLogger(__name__)
 
 # def corner_offset(center_off_arr, raw_res_arr, crop_res_arr):
 #     return np.round((center_off_arr + raw_res_arr / 2.0 - crop_res_arr / 2.0)/crop_res_arr)*crop_res_arr
+
+
+def generate_4d_scale_attrs(
+    voxel_size: list,
+    translation: list,
+    units: list = ["nanometer", "nanometer", "nanometer"],
+    axes: list = ["z", "y", "x"],
+    arr_name: str = "s0",
+):
+    # ensure floats
+    voxel_size_f = [float(v) for v in voxel_size]
+    translation_f = [float(t) for t in translation]
+
+    # channel axis first
+    channel_axis = {"name": "c", "type": "channel"}
+    spatial_axes = [{"name": axis, "type": "space", "unit": unit} for axis, unit in zip(axes, units)]
+
+    scale_list = [1.0] + voxel_size_f
+    translation_list = [0.0] + translation_f
+
+    z_attrs: dict = {"multiscales": [{}]}
+    z_attrs["multiscales"][0]["axes"] = [channel_axis] + spatial_axes
+    z_attrs["multiscales"][0]["datasets"] = [
+        {
+            "coordinateTransformations": [
+                {"scale": scale_list, "type": "scale"},
+                {"translation": translation_list, "type": "translation"},
+            ],
+            "path": arr_name,
+        }
+    ]
+    z_attrs["multiscales"][0]["version"] = "0.4"
+
+    return z_attrs
+
 
 def corner_offset(center_off_arr, raw_res_arr, crop_res_arr):
     return center_off_arr + raw_res_arr / 2.0 - crop_res_arr / 2.0
@@ -50,6 +86,7 @@ def read_data_yaml(yaml_file: BinaryIO):
                 crop_copies.append(len(copies))
     return label_stores, raw_stores, crop_copies
 
+
 from fly_organelles.anistropic_utils import (
     change_multiscale_name,
     get_axes_object,
@@ -57,31 +94,32 @@ from fly_organelles.anistropic_utils import (
     get_downsampling_factors,
     generate_standard_multiscale,
 )
+
+
 def get_nominal_attrs(raw_zarr_grp):
-        # check raw data to see if it is isotropic
-        offsets, samplings, _ = get_scale_info(raw_zarr_grp)
-        sampling = next(iter(samplings.values()))
-        isotropic = len(set(sampling)) == 1
-        attrs = raw_zarr_grp.attrs.asdict()
-        if isotropic:
-            change_multiscale_name(attrs, "nominal")
-        else:
-            change_multiscale_name(attrs, "estimated")
-            axes = get_axes_object(raw_zarr_grp)
-            dataset_paths = sorted(samplings.keys(), key=lambda x: min(samplings[x]))
-            nominal_scale, nominal_offset = infer_nominal_transform(
-                samplings[dataset_paths[0]], offsets[dataset_paths[0]]
-            )
-            factors = get_downsampling_factors(samplings)
-            ms_nominal = generate_standard_multiscale(
-                dataset_paths=dataset_paths,
-                axes=axes,
-                base_resolution=nominal_scale,
-                base_offset=nominal_offset,
-                factors=factors,
-            )
-            attrs["multiscales"] = [ms_nominal.model_dump()]
-        return attrs
+    # check raw data to see if it is isotropic
+    offsets, samplings, _ = get_scale_info(raw_zarr_grp)
+    sampling = next(iter(samplings.values()))
+    isotropic = len(set(sampling)) == 1
+    attrs = raw_zarr_grp.attrs.asdict()
+    if isotropic:
+        change_multiscale_name(attrs, "nominal")
+    else:
+        change_multiscale_name(attrs, "estimated")
+        axes = get_axes_object(raw_zarr_grp)
+        dataset_paths = sorted(samplings.keys(), key=lambda x: min(samplings[x]))
+        nominal_scale, nominal_offset = infer_nominal_transform(samplings[dataset_paths[0]], offsets[dataset_paths[0]])
+        factors = get_downsampling_factors(samplings)
+        ms_nominal = generate_standard_multiscale(
+            dataset_paths=dataset_paths,
+            axes=axes,
+            base_resolution=nominal_scale,
+            base_offset=nominal_offset,
+            factors=factors,
+        )
+        attrs["multiscales"] = [ms_nominal.model_dump()]
+    return attrs
+
 
 def get_nominal_scale_info(zarr_grp):
     attrs = get_nominal_attrs(zarr_grp)
@@ -138,6 +176,18 @@ def find_target_scale(zarr_grp, target_resolution):
 
 from gunpowder.nodes import BatchFilter
 
+
+def has_resolution(path, res):
+    raw_grp = fst.read(path)
+    if not isinstance(res, list):
+        res = [res, res, res]
+    try:
+        _ = find_target_scale(raw_grp, res)
+        return True
+    except:
+        return False
+
+
 class ShiftNorm(BatchFilter):
     def __init__(self, array, min, max):
         self.array = array
@@ -149,46 +199,47 @@ class ShiftNorm(BatchFilter):
             return
 
         raw = batch.arrays[self.array]
-        raw.data = raw.data.clip(self.min, self.max)-self.min
-        raw.data /= (self.max-self.min)
+        raw.data = raw.data.clip(self.min, self.max) - self.min
+        raw.data /= self.max - self.min
         # print(f"new min: {raw.data.min()}, new max: {raw.data.max()}")
+
 
 from edt import edt
 from gunpowder.array import Array
 from gunpowder.batch import Batch
 
+
 class Distance(gp.BatchFilter):
 
-  def __init__(self, array,sigma=10.0):
-    self.array = array
-    self.sigma = sigma
+    def __init__(self, array, sigma=10.0):
+        self.array = array
+        self.sigma = sigma
 
-  def setup(self):
-    spec = self.spec[self.array].copy()
-    spec.dtype = "float32"
-    self.updates(self.array, spec)
-    self.enable_autoskip()
+    def setup(self):
+        spec = self.spec[self.array].copy()
+        spec.dtype = "float32"
+        self.updates(self.array, spec)
+        self.enable_autoskip()
+
+    def process(self, batch, request):
+        source = batch.arrays[self.array]
+        source_data = source.data
+        source_data = np.tanh((edt(source_data) - edt(source_data == 0)) / self.sigma)
+        source_data = (source_data + 1) / 2
+
+        cast_data = source_data.astype("float32")
+
+        target_spec = source.spec.copy()
+        target_spec.dtype = cast_data.dtype
+        target_array = Array(cast_data, target_spec)
+
+        # create output array
+        outputs = Batch()
+        outputs.arrays[self.array] = target_array
+
+        return outputs
 
 
-  def process(self, batch, request):
-    source = batch.arrays[self.array]
-    source_data = source.data
-    source_data = np.tanh((edt(source_data) - edt(source_data == 0)) / self.sigma)
-    source_data = (source_data+1)/2
-
-    cast_data = source_data.astype("float32")
-
-    target_spec = source.spec.copy()
-    target_spec.dtype = cast_data.dtype
-    target_array = Array(cast_data, target_spec)
-
-    # create output array
-    outputs = Batch()
-    outputs.arrays[self.array] = target_array
-
-    return outputs
-    
-    
 class Binarize(BatchFilter):
     def __init__(self, array):
         self.array = array
@@ -211,9 +262,7 @@ class Binarize(BatchFilter):
 
 
 class Distances(BatchFilter):
-    def __init__(self, array,
-                 norm = "tanh",
-                 dt_scale_factor = 80.0):
+    def __init__(self, array, norm="tanh", dt_scale_factor=80.0):
         self.array = array
         self.norm = norm
         self.dt_scale_factor = dt_scale_factor
@@ -224,7 +273,7 @@ class Distances(BatchFilter):
     def process(self, batch, request):
         if self.array not in batch.arrays:
             return
-        
+
         voxel_size = self.spec[self.array].voxel_size
 
         raw = batch.arrays[self.array]
@@ -278,9 +327,7 @@ class Distances(BatchFilter):
             boundaries = 1.0 - boundaries
 
             if np.sum(boundaries == 0) == 0:
-                max_distance = min(
-                    dim * vs / 2 for dim, vs in zip(channel.shape, voxel_size)
-                )
+                max_distance = min(dim * vs / 2 for dim, vs in zip(channel.shape, voxel_size))
                 if np.sum(channel) == 0:
                     distances = -np.ones(channel.shape, dtype=np.float32) * max_distance
                 else:

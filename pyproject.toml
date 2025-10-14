@@ -41,6 +41,8 @@ dependencies = [
   "neuroglancer",
   "dask",
   "tensorboardX",
+  "tensorboard",
+  "edt",
 ]
 
 [project.urls]
