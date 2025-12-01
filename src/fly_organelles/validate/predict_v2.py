@@ -8,6 +8,11 @@ import fibsem_tools as fst
 from fly_organelles.config import get_model
 from fly_organelles.utils import find_target_scale, ShiftNorm
 
+from tqdm import tqdm
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def predict_checkpoint_v2(
     model,
@@ -90,110 +95,146 @@ def predict_checkpoint_v2(
                 )
                 block_count = 0
                 total_shape = output_roi.shape
-                for z_offset in range(0, int(total_shape[0]), int(output_size[0])):
-                    for y_offset in range(0, int(total_shape[1]), int(output_size[1])):
-                        for x_offset in range(0, int(total_shape[2]), int(output_size[2])):
-                            block_offset = output_roi.offset + Coordinate([z_offset, y_offset, x_offset])
-                            block_shape = Coordinate(
-                                [
-                                    min(output_size[0], total_shape[0] - z_offset),
-                                    min(output_size[1], total_shape[1] - y_offset),
-                                    min(output_size[2], total_shape[2] - x_offset),
-                                ]
-                            )
-                            target_write_roi = gp.Roi(block_offset, block_shape)
-                            target_center = target_write_roi.offset + target_write_roi.shape / 2
-                            ideal_input_roi = gp.Roi(target_center - input_size / 2, input_size)
-                            predicted_output_offset = ideal_input_roi.offset + context
-                            actual_input_roi = ideal_input_roi.intersect(raw_roi)
-                            input_offset_shift = actual_input_roi.offset - ideal_input_roi.offset
-                            input_shape_diff = ideal_input_roi.shape - actual_input_roi.shape
-                            z_start, y_start, x_start = actual_input_roi.get_begin()
-                            z_end, y_end, x_end = actual_input_roi.get_end()
-                            # Debug prints for ROI and shapes
-                            print(f"Block {block_count+1}: write_roi={target_write_roi}, input_roi={actual_input_roi}")
-                            print(f"  input_offset_shift={input_offset_shift}, input_shape_diff={input_shape_diff}")
-                            print(f"  zyx start-end: {z_start}-{z_end}, {y_start}-{y_end}, {x_start}-{x_end}")
+                z_steps = range(0, int(total_shape[0]), int(output_size[0]))
+                y_steps = range(0, int(total_shape[1]), int(output_size[1]))
+                x_steps = range(0, int(total_shape[2]), int(output_size[2]))
+                total_blocks = len(z_steps) * len(y_steps) * len(x_steps)
+                with tqdm(total=total_blocks, desc=f"{crop}/{label}") as pbar:
+                    for z_offset in z_steps:
+                        for y_offset in y_steps:
+                            for x_offset in x_steps:
+                                block_offset = output_roi.offset + Coordinate([z_offset, y_offset, x_offset])
+                                block_shape = Coordinate(
+                                    [
+                                        min(output_size[0], total_shape[0] - z_offset),
+                                        min(output_size[1], total_shape[1] - y_offset),
+                                        min(output_size[2], total_shape[2] - x_offset),
+                                    ]
+                                )
+                                target_write_roi = gp.Roi(block_offset, block_shape)
+                                target_center = target_write_roi.offset + target_write_roi.shape / 2
+                                ideal_input_roi = gp.Roi(target_center - input_size / 2, input_size)
+                                predicted_output_offset = ideal_input_roi.offset + context
+                                actual_input_roi = ideal_input_roi.intersect(raw_roi)
+                                input_offset_shift = actual_input_roi.offset - ideal_input_roi.offset
+                                input_shape_diff = ideal_input_roi.shape - actual_input_roi.shape
+                                z_start, y_start, x_start = actual_input_roi.get_begin()
+                                z_end, y_end, x_end = actual_input_roi.get_end()
+                                # Debug prints for ROI and shapes
+                                logger.debug(
+                                    f"Block {block_count+1}: write_roi={target_write_roi}, input_roi={actual_input_roi}"
+                                )
+                                logger.debug(
+                                    f"  input_offset_shift={input_offset_shift}, input_shape_diff={input_shape_diff}"
+                                )
+                                logger.debug(
+                                    f"  zyx start-end: {z_start}-{z_end}, {y_start}-{y_end}, {x_start}-{x_end}"
+                                )
 
-                            # Use same slicing logic as benchmark (no -1)
-                            raw_input = raw_xarray.sel(
-                                z=slice(z_start, z_end),
-                                y=slice(y_start, y_end),
-                                x=slice(x_start, x_end),
-                            )
-                            raw_input = np.asarray(raw_input)
-                            # Pad if needed
-                            pad_before = tuple(
-                                int(max(0, -shift // vs)) for shift, vs in zip(input_offset_shift, voxel_size)
-                            )
-                            pad_after = tuple(int(max(0, diff // vs)) for diff, vs in zip(input_shape_diff, voxel_size))
-                            if any(pb > 0 or pa > 0 for pb, pa in zip(pad_before, pad_after)):
-                                raw_input = np.pad(
-                                    raw_input, tuple((pb, pa) for pb, pa in zip(pad_before, pad_after)), mode='edge'
+                                # Use same slicing logic as benchmark (no -1)
+                                raw_input = raw_xarray.sel(
+                                    z=slice(z_start, z_end),
+                                    y=slice(y_start, y_end),
+                                    x=slice(x_start, x_end),
                                 )
-                            print(f"  raw_input shape after pad: {raw_input.shape}")
-                            raw_input = raw_input.astype(np.float32)
-                            raw_input = (raw_input - minc) / (maxc - minc)
-                            raw_input = raw_input * 2 - 1
-                            raw_input = np.expand_dims(raw_input, 0)
-                            raw_input = np.expand_dims(raw_input, 0)
-                            print(f"  raw_input shape for model: {raw_input.shape}")
-                            # Ensure input block is exactly input_shape
-                            target_shape = tuple(input_shape)
-                            current_shape = raw_input.shape[-3:]
-                            pad_needed = [max(0, t - c) for t, c in zip(target_shape, current_shape)]
-                            crop_needed = [max(0, c - t) for t, c in zip(target_shape, current_shape)]
-                            # Pad if needed
-                            if any(pad_needed):
-                                pad_width = [(0, 0), (0, 0)] + [(0, p) for p in pad_needed]
-                                raw_input = np.pad(raw_input, pad_width, mode='edge')
-                                print(f"  padded raw_input to {raw_input.shape}")
-                            # Crop if needed
-                            if any(crop_needed):
-                                slices = [slice(None), slice(None)] + [slice(0, t) for t in target_shape]
-                                raw_input = raw_input[tuple(slices)]
-                                print(f"  cropped raw_input to {raw_input.shape}")
-                            # Final check
-                            assert raw_input.shape[-3:] == tuple(
-                                input_shape
-                            ), f"Input shape mismatch: {raw_input.shape[-3:]} vs {input_shape}"
-                            with torch.no_grad():
-                                predictions = (
-                                    model.forward(torch.from_numpy(raw_input).float().to(device))
-                                    .detach()
-                                    .cpu()
-                                    .numpy()[0]
+                                raw_input = np.asarray(raw_input)
+                                # Pad if needed
+                                pad_before = tuple(
+                                    int(max(0, -shift // vs)) for shift, vs in zip(input_offset_shift, voxel_size)
                                 )
-                            print(f"  predictions shape: {predictions.shape}")
-                            predicted_shape_voxels = Coordinate(predictions.shape[1:])
-                            predicted_shape = predicted_shape_voxels * Coordinate(voxel_size)
-                            predicted_roi = gp.Roi(predicted_output_offset, predicted_shape)
-                            actual_write_roi = target_write_roi.intersect(predicted_roi).intersect(output_roi)
-                            if not actual_write_roi.empty:
-                                pred_relative = actual_write_roi - predicted_roi.offset
-                                pred_slices = tuple(
-                                    slice(int(b // vs), int(e // vs))
-                                    for b, e, vs in zip(
-                                        pred_relative.get_begin(),
-                                        pred_relative.get_end(),
-                                        voxel_size,
+                                pad_after = tuple(
+                                    int(max(0, diff // vs)) for diff, vs in zip(input_shape_diff, voxel_size)
+                                )
+                                if any(pb > 0 or pa > 0 for pb, pa in zip(pad_before, pad_after)):
+                                    # Pad with zeros for edge blocks
+                                    raw_input = np.pad(
+                                        raw_input,
+                                        tuple((pb, pa) for pb, pa in zip(pad_before, pad_after)),
+                                        mode='constant',
+                                        constant_values=0,
                                     )
-                                )
-                                predictions_to_write = predictions[(slice(None),) + pred_slices]
-                                prediction_array[actual_write_roi] = predictions_to_write
-                                # Export raw
-                                raw_relative = actual_write_roi - output_roi.offset
-                                raw_slices = tuple(
-                                    slice(int(b // vs), int(e // vs))
-                                    for b, e, vs in zip(
-                                        raw_relative.get_begin(),
-                                        raw_relative.get_end(),
-                                        voxel_size,
+                                logger.debug(f"  raw_input shape after pad: {raw_input.shape}")
+                                raw_input = raw_input.astype(np.float32)
+                                raw_input = (raw_input - minc) / (maxc - minc)
+                                raw_input = raw_input * 2 - 1
+                                raw_input = np.expand_dims(raw_input, 0)
+                                raw_input = np.expand_dims(raw_input, 0)
+                                logger.debug(f"  raw_input shape for model: {raw_input.shape}")
+                                # Ensure input block is exactly input_shape
+                                target_shape = tuple(input_shape)
+                                current_shape = raw_input.shape[-3:]
+                                pad_needed = [max(0, t - c) for t, c in zip(target_shape, current_shape)]
+                                crop_needed = [max(0, c - t) for t, c in zip(target_shape, current_shape)]
+                                # Pad if needed
+                                if any(pad_needed):
+                                    pad_width = [(0, 0), (0, 0)] + [(0, p) for p in pad_needed]
+                                    raw_input = np.pad(raw_input, pad_width, mode='constant', constant_values=0)
+                                    logger.debug(f"  padded raw_input to {raw_input.shape}")
+                                # Crop if needed
+                                if any(crop_needed):
+                                    slices = [slice(None), slice(None)] + [slice(0, t) for t in target_shape]
+                                    raw_input = raw_input[tuple(slices)]
+                                    logger.debug(f"  cropped raw_input to {raw_input.shape}")
+                                # Final check
+                                assert raw_input.shape[-3:] == tuple(
+                                    input_shape
+                                ), f"Input shape mismatch: {raw_input.shape[-3:]} vs {input_shape}"
+                                with torch.no_grad():
+                                    predictions = (
+                                        model.forward(torch.from_numpy(raw_input).float().to(device))
+                                        .detach()
+                                        .cpu()
+                                        .numpy()[0]
                                     )
-                                )
-                                raw_to_write = raw_input[0, 0][raw_slices]
-                                raw_to_write = np.expand_dims(raw_to_write, 0)
-                                raw_array[actual_write_roi] = raw_to_write
-                            block_count += 1
-                            print(f"Processed block {block_count}", end="\r")
-                    print(f"\nProcessed {block_count} blocks for {label}")
+                                logger.debug(f"  predictions shape: {predictions.shape}")
+                                predicted_shape_voxels = Coordinate(predictions.shape[1:])
+                                predicted_shape = predicted_shape_voxels * Coordinate(voxel_size)
+                                predicted_roi = gp.Roi(predicted_output_offset, predicted_shape)
+                                actual_write_roi = target_write_roi.intersect(predicted_roi).intersect(output_roi)
+                                if not actual_write_roi.empty:
+                                    pred_relative = actual_write_roi - predicted_roi.offset
+                                    pred_slices = tuple(
+                                        slice(int(b // vs), int(e // vs))
+                                        for b, e, vs in zip(
+                                            pred_relative.get_begin(),
+                                            pred_relative.get_end(),
+                                            voxel_size,
+                                        )
+                                    )
+                                    predictions_to_write = predictions[(slice(None),) + pred_slices]
+                                    prediction_array[actual_write_roi] = predictions_to_write
+                                    # Export raw
+                                    raw_relative = actual_write_roi - output_roi.offset
+                                    raw_slices = tuple(
+                                        slice(int(b // vs), int(e // vs))
+                                        for b, e, vs in zip(
+                                            raw_relative.get_begin(),
+                                            raw_relative.get_end(),
+                                            voxel_size,
+                                        )
+                                    )
+                                    raw_to_write = raw_input[0, 0][raw_slices]
+                                    raw_to_write = np.expand_dims(raw_to_write, 0)
+                                    # Ensure shape matches expected region
+                                    expected_shape = (1,) + tuple(
+                                        map(int, actual_write_roi.shape / Coordinate(voxel_size))
+                                    )
+                                    actual_shape = raw_to_write.shape
+                                    # Pad or crop as needed
+                                    pad_width = [(0, max(0, e - a)) for a, e in zip(actual_shape, expected_shape)]
+                                    if any(pw[1] > 0 for pw in pad_width):
+                                        raw_to_write = np.pad(
+                                            raw_to_write, pad_width, mode='constant', constant_values=0
+                                        )
+                                    # Crop if too large
+                                    crop_slices = tuple(slice(0, e) for e in expected_shape)
+                                    raw_to_write = raw_to_write[crop_slices]
+                                    # Final check
+                                    assert (
+                                        raw_to_write.shape == expected_shape
+                                    ), f"raw_to_write shape {raw_to_write.shape} != expected {expected_shape}"
+                                    raw_array[actual_write_roi] = raw_to_write
+                                block_count += 1
+                                pbar.update(1)
+                                logger.debug(f"Processed block {block_count}")
+                    logger.debug(f"Processed {block_count} blocks for {label}")

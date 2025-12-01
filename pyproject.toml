@@ -55,6 +55,7 @@ data_prep = "fly_organelles.data_preparation:cli"
 train = "fly_organelles.run:main"
 inference = "fly_organelles.inference:cli"
 validate_run = "fly_organelles.validate.validate_run:main"
+view_snapshots = "fly_organelles.view_snapshots:main"
 
 [tool.hatch.version]
 path = "src/fly_organelles/__about__.py"

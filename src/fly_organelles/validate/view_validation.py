@@ -154,8 +154,10 @@ def main(run_path):
     organelles = [
         d
         for d in os.listdir(os.path.join(checkpoints_path[0], crops[0]))
-        if os.path.isdir(os.path.join(checkpoints_path[0], crops[0], d))
+        if os.path.isdir(os.path.join(checkpoints_path[0], crops[0], d)) and not d.startswith("raw")
     ]
+    print("Crops found:", crops)
+    print("Organelles found:", organelles)
 
     neuroglancer.set_server_bind_address("0.0.0.0")
     # neuroglancer.cli.add_server_arguments(ap)
@@ -201,7 +203,7 @@ def main(run_path):
 #     main(args.run_path)
 
 # Use the generator
-for viewer in main("/groups/cellmap/cellmap/zouinkhim/exp_salivary/runs/setup_42"):
+for viewer in main("/groups/cellmap/cellmap/zouinkhim/exp_salivary/runs/setup_48"):
     print("New link generated:")
     print(viewer)
     input("Press Enter to generate the next link...")

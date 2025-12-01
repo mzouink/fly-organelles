@@ -21,6 +21,41 @@ def load_eval_model(num_labels, checkpoint_path):
 
 
 class AffinitiesLoss(nn.Module):
+    def __init__(self, lsds_weight: float = 0.4, affinities_weight: float = 0.6, nb_affinities: int = 3):
+        super().__init__()
+        self.lsds_weight = lsds_weight
+        self.affinities_weight = affinities_weight
+        self.nb_affinities = nb_affinities
+
+    def forward(self, output: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+
+        # Validate channel and mask dimensions
+        if output.shape != target.shape:
+            raise ValueError(f"Output and target must have the same shape, got {output.shape} vs {target.shape}")
+        if mask.shape != output.shape:
+            raise ValueError(f"Mask must match output shape, got {mask.shape} vs {output.shape}")
+        if output.shape[1] < self.nb_affinities:
+            raise ValueError(f"Expected at least {self.nb_affinities} affinity channels, got {output.shape[1]}")
+
+        # Split predictions, targets, and mask into affinities and LSDS parts
+        out_aff = output[:, : self.nb_affinities]
+        tgt_aff = target[:, : self.nb_affinities]
+        mask_aff = mask[:, : self.nb_affinities].float()
+
+        out_lsds = output[:, self.nb_affinities :]
+        tgt_lsds = target[:, self.nb_affinities :]
+        mask_lsds = mask[:, self.nb_affinities :].float()
+
+        bce = torch.nn.BCEWithLogitsLoss(reduction="none")(out_aff, tgt_aff) * mask_aff
+        # print(bce.mean())
+
+        loss_lsds = torch.nn.MSELoss(reduction="none")(out_lsds, tgt_lsds) * mask_lsds
+        # print(loss_lsds.mean())
+
+        return self.affinities_weight * bce.mean() + self.lsds_weight * loss_lsds.mean()
+
+
+class AffinitiesLossV2(nn.Module):
     def __init__(
         self,
         lsds_weight: float = 1.0,

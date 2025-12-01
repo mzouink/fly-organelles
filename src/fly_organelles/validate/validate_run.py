@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 from fly_organelles.model import StandardUnet
 from fly_organelles.data import CellMapCropSource
 from fly_organelles.utils import ShiftNorm, generate_4d_scale_attrs
-from fly_organelles.validate.score import f1_score
+from fly_organelles.validate.score import f1_score, balanced_f1_score, balanced_iou_score
 from fly_organelles.utils import find_target_scale
 from fly_organelles.config import load_config, get_model
 import sys
@@ -25,13 +25,16 @@ logger = logging.getLogger(__name__)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+score_functions_to_use = [f1_score, balanced_f1_score, balanced_iou_score]
+
 
 def load_scores_yaml(setup_path: Path) -> dict:
     """Load existing scores from scores.yaml if it exists."""
     scores_file = setup_path / "scores.yaml"
     if scores_file.exists():
         with open(scores_file, "r") as f:
-            return yaml.safe_load(f) or {}
+            return yaml.safe_load(f)
+    print(f"No existing scores.yaml found in {setup_path}")
     return {}
 
 
@@ -52,21 +55,23 @@ def save_scores_yaml(setup_path: Path, scores_dict: dict):
     # Deep merge: update existing_scores with new scores_dict, keeping higher scores
     def deep_merge(base: dict, update: dict) -> dict:
         """Recursively merge update dict into base dict.
-        For score dictionaries (containing 'f1', 'accuracy', etc.), only update if new F1 is higher."""
+        For score dictionaries (containing metrics), only update if new f1_score is higher."""
         for key, value in update.items():
             if key in base:
                 # Check if both are dictionaries
                 if isinstance(base[key], dict) and isinstance(value, dict):
-                    # Check if this is a scores dict (has 'f1' key)
-                    if 'f1' in value and 'f1' in base[key]:
-                        # This is a scores dictionary - only update if new F1 is higher
-                        if value['f1'] > base[key]['f1']:
-                            logger.warning(f"Updating scores for {key}: F1 {base[key]['f1']:.4f} -> {value['f1']:.4f}")
-                            base[key] = value
-                        else:
+                    # Check if this is a scores dict (has 'f1_score' key)
+                    if 'f1_score' in value and 'f1_score' in base[key]:
+                        # This is a scores dictionary - only update if new f1_score is higher
+                        if value['f1_score'] > base[key]['f1_score']:
                             logger.warning(
-                                f"Keeping existing scores for {key}: F1 {base[key]['f1']:.4f} >= {value['f1']:.4f}"
+                                f"Updating scores for {key}: f1_score {base[key]['f1_score']:.4f} -> {value['f1_score']:.4f}"
                             )
+                            base[key] = value
+                        # else:
+                        #     logger.warning(
+                        #         f"Keeping existing scores for {key}: f1_score {base[key]['f1_score']:.4f} >= {value['f1_score']:.4f}"
+                        #     )
                     else:
                         # Not a scores dict, recurse deeper
                         deep_merge(base[key], value)
@@ -156,7 +161,6 @@ def score_checkpoint(
     labels,
     voxel_size,
     device,
-    tb_writer: SummaryWriter = None,
     is_lsd=False,
     affinities_map=None,
     setup_path: Path = None,
@@ -183,16 +187,16 @@ def score_checkpoint(
                             if dataset in scores_dict[checkpoint_name]:
                                 if crop in scores_dict[checkpoint_name][dataset]:
                                     if label in scores_dict[checkpoint_name][dataset][crop]:
-                                        # Check if F1 score is < 0.5 (likely buggy pre-sigmoid scores)
+                                        # Check if f1_score is < 0.5 (likely buggy pre-sigmoid scores)
                                         existing_scores = scores_dict[checkpoint_name][dataset][crop][label]
-                                        f1_score_val = existing_scores.get('f1', 0)
+                                        f1_score_val = existing_scores.get('f1_score', 0)
                                         if f1_score_val < 0.5:
                                             logger.warning(
-                                                f"Re-scoring {checkpoint_name} on {dataset}/{crop}/{label} - F1={f1_score_val:.4f} (likely buggy score)"
+                                                f"Re-scoring {checkpoint_name} on {dataset}/{crop}/{label} - f1_score={f1_score_val:.4f} (likely buggy score)"
                                             )
                                         else:
                                             logger.warning(
-                                                f"Skipping scoring for {checkpoint_name} on {dataset}/{crop}/{label} - F1={f1_score_val:.4f} already good"
+                                                f"Skipping scoring for {checkpoint_name} on {dataset}/{crop}/{label} - f1_score={f1_score_val:.4f} already good"
                                             )
                                             continue
 
@@ -200,8 +204,16 @@ def score_checkpoint(
                     label_scale, _, _ = find_target_scale(label_grp, list(voxel_size))
                     gt_path = Path(ds_info["val"][crop]) / label / label_scale
                     prediction_path = output_path / f"{checkpoint_path.name}.zarr" / crop / label / "s0"
-                    z_gt = zarr.open(gt_path, mode='r')
-                    z_pred = zarr.open(prediction_path, mode='r')
+                    try:
+                        z_gt = zarr.open(gt_path, mode='r')
+                    except Exception as e:
+                        logger.error(f"Error reading ground truth at {gt_path}: {e}")
+                        raise e
+                    try:
+                        z_pred = zarr.open(prediction_path, mode='r')
+                    except Exception as e:
+                        logger.error(f"Error reading prediction at {prediction_path}: {e}")
+                        raise e
 
                     # Handle LSD predictions - extract relevant channels
                     if is_lsd:
@@ -212,6 +224,8 @@ def score_checkpoint(
                             # Get affinity predictions (first num_affs channels)
                             num_affs = len(affinities_map)
                             pred_ts = torch.from_numpy(pred_array[:num_affs]).float().to(device)
+                            # TODO check if this is necessary
+                            pred_ts = torch.sigmoid(pred_ts)
 
                             # Convert ground truth to affinities using the same method as training
                             from fly_organelles.lsds.lite.affs import get_affs as get_affs_lite
@@ -231,10 +245,12 @@ def score_checkpoint(
                         gt_array = np.array(z_gt[:], dtype=np.float32)
                         label_ts = (torch.from_numpy(gt_array) > 0).long().to(device)
 
-                    # Apply sigmoid activation to convert logits to probabilities
+                    # Ensure pred_ts and label_ts have compatible shapes for loss calculation
+                    if pred_ts.ndim == label_ts.ndim + 1 and pred_ts.shape[0] == 1:
+                        pred_ts = pred_ts.squeeze(0)
                     # Model outputs are logits, need to apply sigmoid before thresholding
                     # TODO this is a fix for fly models only
-                    pred_ts = torch.sigmoid(pred_ts)
+                    # pred_ts = torch.sigmoid(pred_ts)
 
                     scores = {}
                     threshold = 0.5
@@ -244,43 +260,36 @@ def score_checkpoint(
                         # For affinities, label_ts is already float (affinities values)
                         # We need to binarize it for comparison
                         label_thresh = (label_ts > threshold).long()
-                        # Calculate metrics per affinity channel and average
-                        f1_scores = []
+
+                        # Calculate metrics per affinity channel and average using score_functions_to_use
+                        for score_fn in score_functions_to_use:
+                            score_name = score_fn.__name__
+                            channel_scores = []
+                            for ch in range(pred_thresh.shape[0]):
+                                channel_scores.append(score_fn(label_thresh[ch], pred_thresh[ch]))
+                            scores[score_name] = np.mean(channel_scores)
+
+                        # Add accuracy and val_loss
                         accuracies = []
                         for ch in range(pred_thresh.shape[0]):
-                            f1_scores.append(f1_score(label_thresh[ch], pred_thresh[ch]))
                             correct = (pred_thresh[ch] == label_thresh[ch]).sum()
                             total = torch.numel(label_thresh[ch])
                             accuracies.append((correct / total).cpu().numpy().item())
-
-                        scores["f1"] = np.mean(f1_scores)
                         scores["accuracy"] = np.mean(accuracies)
                         scores["val_loss"] = val_loss(pred_thresh.float(), label_thresh.float()).cpu().numpy().item()
                     else:
-                        # Regular binary segmentation
-                        scores["f1"] = f1_score(label_ts, pred_thresh)
+                        # Regular binary segmentation - use score_functions_to_use
+                        for score_fn in score_functions_to_use:
+                            score_name = score_fn.__name__
+                            scores[score_name] = score_fn(label_ts, pred_thresh)
+
+                        # Add accuracy and val_loss
                         scores["val_loss"] = val_loss(pred_thresh.float(), label_ts.float()).cpu().numpy().item()
                         correct = (pred_thresh == label_ts).sum()
                         total = torch.numel(label_ts)
                         accuracy = correct / total
                         scores["accuracy"] = accuracy.cpu().numpy().item()
 
-                    if tb_writer is not None:
-                        tb_writer.add_scalar(
-                            f"val/{dataset}_{crop}_{label}/f1",
-                            scores["f1"],
-                            global_step=int(checkpoint_path.name.split("_")[-1]),
-                        )
-                        tb_writer.add_scalar(
-                            f"val/{dataset}_{crop}_{label}/val_loss",
-                            scores["val_loss"],
-                            global_step=int(checkpoint_path.name.split("_")[-1]),
-                        )
-                        tb_writer.add_scalar(
-                            f"val/{dataset}_{crop}_{label}/accuracy",
-                            scores["accuracy"],
-                            global_step=int(checkpoint_path.name.split("_")[-1]),
-                        )
                     logger.warning(f"Scores for {checkpoint_path.name} on {dataset} {crop} {label}: {scores}")
 
                     # Save scores to the parent zarr group (not the s0 array)
@@ -303,6 +312,56 @@ def score_checkpoint(
                 raise e
 
 
+def check_zero_crops(setup_path: Path) -> bool:
+    """Check if any validation crops have all-zero ground truth labels.
+
+    Args:
+        setup_path: Path to the setup directory containing config.yaml and validation data
+
+    Returns:
+        True if all crops have non-zero labels, False if any crop is all zeros
+    """
+    if not isinstance(setup_path, Path):
+        setup_path = Path(setup_path)
+
+    config = load_config(setup_path / "config.yaml")
+    labels = config.labels
+    yaml_file = config.val_yaml
+    voxel_size = config.voxel_size
+    voxel_size = gp.Coordinate(voxel_size)
+
+    with open(setup_path / yaml_file, "r") as data_yaml:
+        datasets = yaml.safe_load(data_yaml)
+
+    all_good = True
+
+    for dataset, ds_info in datasets["datasets"].items():
+        if not "val" in ds_info:
+            logger.warning(f"Skipping {dataset} as it has no validation set.")
+            continue
+
+        for crop in ds_info["val"]:
+            for label in labels:
+                try:
+                    label_grp = fst.read(Path(ds_info["val"][crop]) / label)
+                    label_scale, _, _ = find_target_scale(label_grp, list(voxel_size))
+                    gt_path = Path(ds_info["val"][crop]) / label / label_scale
+                    z_gt = zarr.open(gt_path, mode='r')
+                    gt_array = np.array(z_gt[:])
+
+                    if np.all(gt_array == 0):
+                        logger.error(f"Crop {crop} for label {label} in dataset {dataset} is all zeros!")
+                        all_good = False
+                    else:
+                        logger.info(f"Crop {crop} for label {label} in dataset {dataset} has non-zero values")
+
+                except Exception as e:
+                    logger.error(f"Error checking crop {crop} for label {label} in dataset {dataset}: {e}")
+                    all_good = False
+
+    return all_good
+
+
 def update_tensorboard(setup_path: Path):
     """Update TensorBoard with scores from scores.yaml.
 
@@ -321,19 +380,37 @@ def update_tensorboard(setup_path: Path):
 
     # Load scores from scores.yaml
     scores_dict = load_scores_yaml(setup_path)
+    num_checkpoints = len(scores_dict)
+    logger.warning(f"Loaded {num_checkpoints} checkpoints from scores.yaml")
 
     if not scores_dict:
         logger.warning(f"No scores found in {setup_path / 'scores.yaml'}")
         return
 
+    # Clear existing TensorBoard event files to avoid confusion with multiple runs
+    # import shutil
+
+    # if os.path.exists(log_dir):
+    #     logger.warning(f"Clearing existing TensorBoard logs in {log_dir}")
+    #     shutil.rmtree(log_dir)
+    # os.makedirs(log_dir, exist_ok=True)
+
     # Create TensorBoard writer
     writer = SummaryWriter(log_dir=log_dir)
 
+    # Sort checkpoints by iteration number (ascending order)
+    sorted_checkpoints = sorted(
+        scores_dict.items(), key=lambda item: int(item[0].split("_")[-1]) if item[0].split("_")[-1].isdigit() else 0
+    )
+
     # Iterate through all scores and add to TensorBoard
-    for checkpoint_name, checkpoint_scores in scores_dict.items():
+    checkpoints_processed = 0
+    for checkpoint_name, checkpoint_scores in sorted_checkpoints:
         # Extract iteration number from checkpoint name (e.g., model_checkpoint_10000 -> 10000)
         try:
             iteration = int(checkpoint_name.split("_")[-1])
+            logger.info(f"Processing checkpoint {checkpoint_name} at iteration {iteration}")
+            checkpoints_processed += 1
         except (ValueError, IndexError):
             logger.warning(f"Could not extract iteration from checkpoint name: {checkpoint_name}")
             continue
@@ -342,32 +419,23 @@ def update_tensorboard(setup_path: Path):
             for crop, crop_scores in dataset_scores.items():
                 for label, scores in crop_scores.items():
                     if isinstance(scores, dict):
-                        # Write each metric to TensorBoard
-                        if "f1" in scores:
-                            writer.add_scalar(
-                                f"val/{dataset}_{crop}_{label}/f1",
-                                scores["f1"],
-                                global_step=iteration,
-                            )
-                        if "val_loss" in scores:
-                            writer.add_scalar(
-                                f"val/{dataset}_{crop}_{label}/val_loss",
-                                scores["val_loss"],
-                                global_step=iteration,
-                            )
-                        if "accuracy" in scores:
-                            writer.add_scalar(
-                                f"val/{dataset}_{crop}_{label}/accuracy",
-                                scores["accuracy"],
-                                global_step=iteration,
-                            )
+                        # Write each metric to TensorBoard dynamically
+                        for metric_name, metric_value in scores.items():
+                            if isinstance(metric_value, (int, float, np.floating, np.integer)):
+                                writer.add_scalar(
+                                    f"val/{dataset}_{crop}_{label}/{metric_name}",
+                                    float(metric_value),
+                                    global_step=iteration,
+                                )
 
                         logger.info(f"Added scores for {checkpoint_name} on {dataset}/{crop}/{label} to TensorBoard")
 
     # Flush and close writer
     writer.flush()
     writer.close()
-    logger.warning(f"Successfully updated TensorBoard with scores from {setup_path / 'scores.yaml'}")
+    logger.warning(
+        f"Successfully updated TensorBoard with scores from {checkpoints_processed} checkpoints in {setup_path / 'scores.yaml'}"
+    )
 
 
 def validate_setup(setup_path: Path, checkpoint_iteration: int | None = None, force_gpu: bool = True):
@@ -419,6 +487,34 @@ def validate_setup(setup_path: Path, checkpoint_iteration: int | None = None, fo
 
     for checkpoint in checkpoints:
         checkpoint_path = setup_path / checkpoint
+        checkpoint_name = checkpoint.name
+        # Check if already predicted and f1_score > 0.5 for all labels
+        already_valid = True
+        if checkpoint_name in scores_dict:
+            checkpoint_scores = scores_dict[checkpoint_name]
+            for dataset in datasets["datasets"]:
+                ds_scores = checkpoint_scores.get(dataset, {})
+                for crop in datasets["datasets"][dataset]["val"]:
+                    crop_scores = ds_scores.get(crop, {})
+                    f1s = []
+                    for label in labels:
+                        label_scores = crop_scores.get(label, {})
+                        f1_val = label_scores.get("f1_score", 0)
+                        f1s.append(f1_val)
+                        # if f1_val <= 0.5:
+                        #     already_valid = False
+                        # If any label/crop/dataset is missing or f1_score <= 0.5, not valid
+                        if not label_scores:
+                            already_valid = False
+                    f1_ss = sum(f1s) / len(labels) if len(labels) > 0 else 0
+                    if f1_ss < 0.5:
+                        already_valid = False
+        else:
+            already_valid = False
+        if already_valid:
+            logger.warning(f"Skipping {checkpoint_name}: already predicted and f1_score > 0.5 for all labels.")
+            continue
+        logger.warning(f"Validating checkpoint: {checkpoint_name}")
         predict_checkpoint_v2(
             model,
             checkpoint_path,
@@ -443,12 +539,12 @@ def validate_setup(setup_path: Path, checkpoint_iteration: int | None = None, fo
             labels,
             voxel_size,
             device,
-            tb_writer=writer,
+            # tb_writer=writer,
             is_lsd=is_lsd,
             affinities_map=affinities_map,
             setup_path=setup_path,
             scores_dict=scores_dict,
-            overwrite=False,  # Don't re-score if already scored
+            overwrite=True,  # Don't re-score if already scored
         )
 
         # Save scores after each checkpoint
@@ -464,13 +560,14 @@ def validate_setup(setup_path: Path, checkpoint_iteration: int | None = None, fo
 def main():
     if len(sys.argv) < 2 or len(sys.argv) > 3:
         logger.warning(
-            "Usage: python file.py /path/to/setup [checkpoint_iteration|--list-missing|--update-tensorboard]"
+            "Usage: python file.py /path/to/setup [checkpoint_iteration|--list-missing|--update-tensorboard|--check]"
         )
         logger.warning(
             "  checkpoint_iteration: optional iteration number (e.g., 10000) to validate a specific checkpoint"
         )
         logger.warning("  --list-missing: list checkpoints that haven't been scored yet")
         logger.warning("  --update-tensorboard: update TensorBoard with scores from scores.yaml")
+        logger.warning("  --check: check if any validation crops have all-zero ground truth labels")
         sys.exit(1)
 
     setup_path = Path(sys.argv[1])
@@ -492,10 +589,34 @@ def main():
         update_tensorboard(setup_path)
         sys.exit(0)
 
+    # Check if user wants to check for zero crops
+    if len(sys.argv) == 3 and sys.argv[2] == "--check":
+        all_good = check_zero_crops(setup_path)
+        if all_good:
+            print("\nAll validation crops have non-zero ground truth labels.")
+            sys.exit(0)
+        else:
+            print("\nERROR: Some validation crops have all-zero ground truth labels!")
+            sys.exit(1)
+
     checkpoint_iteration = int(sys.argv[2]) if len(sys.argv) == 3 else None
     validate_setup(setup_path, checkpoint_iteration)
+    update_tensorboard(setup_path)
 
 
 if __name__ == "__main__":
     main()
-# validate_setup(Path("/groups/cellmap/cellmap/zouinkhim/exp_pancreas/runs/setup_43"))
+
+# validate_setup(Path("/groups/cellmap/cellmap/zouinkhim/exp_salivary/runs/setup_47"))
+
+# %%
+# setup_path = Path("/groups/cellmap/cellmap/zouinkhim/exp_c-elegen/v3/train/runs/20250725_lyso_all_mixed_distance_16nm")
+# setup_path = Path("/groups/cellmap/cellmap/zouinkhim/exp_c-elegen/v3/train/runs/20250806_lyso_mouse_distance_16nm")
+# # validate_setup(setup_path, None)
+# update_tensorboard(setup_path)
+
+# # %%
+# setup_path = Path("/groups/cellmap/cellmap/zouinkhim/exp_c-elegen/v3/train/runs/20250725_lyso_all_mixed_distance_16nm")
+# # validate_setup(setup_path, None)
+# update_tensorboard(setup_path)
+# %%

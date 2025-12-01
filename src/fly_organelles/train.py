@@ -226,6 +226,7 @@ def make_train_pipeline(
     min_mask=None,
     distance_sigma=None,
     lsd_sigma=None,
+    model_input_key="input",
 ):
     if affinities:
         pipeline = make_affinities_data_pipeline(
@@ -255,16 +256,20 @@ def make_train_pipeline(
             distance_sigma=distance_sigma,
         )
 
-        loss_fn = BinarySegmentationLoss()
-        # loss_fn = MaskedMultiLabelBCEwithLogits(label_weights)
+        # loss_fn = BinarySegmentationLoss()
+        if label_weights is None:
+            label_weights = [
+                1.0 / len(labels),
+            ] * len(labels)
+        loss_fn = MaskedMultiLabelBCEwithLogits(label_weights)
     pipeline += gp.PreCache(30, 20)
 
     tr_node = gp.torch.Train(
         model=model,
         loss=loss_fn,
-        optimizer=torch.optim.Adam(lr=l_rate, params=model.parameters()),
-        # optimizer = torch.optim.AdamW(model.parameters(), lr=l_rate, weight_decay=1e-5),
-        inputs={"input": gp.ArrayKey("RAW")},
+        # optimizer=torch.optim.Adam(lr=l_rate, params=model.parameters()),
+        optimizer=torch.optim.AdamW(model.parameters(), lr=l_rate, weight_decay=1e-5),
+        inputs={model_input_key: gp.ArrayKey("RAW")},
         loss_inputs={"output": gp.ArrayKey("OUTPUT"), "target": gp.ArrayKey("LABELS"), "mask": gp.ArrayKey("MASK")},
         outputs={0: gp.ArrayKey("OUTPUT")},
         device="cuda",

@@ -4,6 +4,67 @@ import numpy as np
 import torch
 
 
+def balanced_f1_score(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    """
+    Compute balanced F1 score for binary classification using PyTorch tensors.
+    Calculates F1 for background (label==0) and foreground (label==1), then averages.
+
+    Args:
+        y_true (torch.Tensor): Ground truth labels (0 or 1), shape (N,)
+        y_pred (torch.Tensor): Predicted scores/probabilities or labels, shape (N,)
+
+    Returns:
+        float: Balanced F1 score
+    """
+    y_true = (y_true > 0.5).long()
+    y_pred = (y_pred > 0.5).long()
+
+    # Foreground F1 (label==1)
+    tp_fg = ((y_true == 1) & (y_pred == 1)).sum().item()
+    fp_fg = ((y_true == 0) & (y_pred == 1)).sum().item()
+    fn_fg = ((y_true == 1) & (y_pred == 0)).sum().item()
+    precision_fg = tp_fg / (tp_fg + fp_fg) if (tp_fg + fp_fg) > 0 else 0.0
+    recall_fg = tp_fg / (tp_fg + fn_fg) if (tp_fg + fn_fg) > 0 else 0.0
+    f1_fg = 2 * precision_fg * recall_fg / (precision_fg + recall_fg) if (precision_fg + recall_fg) > 0 else 0.0
+
+    # Background F1 (label==0)
+    tp_bg = ((y_true == 0) & (y_pred == 0)).sum().item()
+    fp_bg = ((y_true == 1) & (y_pred == 0)).sum().item()
+    fn_bg = ((y_true == 0) & (y_pred == 1)).sum().item()
+    precision_bg = tp_bg / (tp_bg + fp_bg) if (tp_bg + fp_bg) > 0 else 0.0
+    recall_bg = tp_bg / (tp_bg + fn_bg) if (tp_bg + fn_bg) > 0 else 0.0
+    f1_bg = 2 * precision_bg * recall_bg / (precision_bg + recall_bg) if (precision_bg + recall_bg) > 0 else 0.0
+
+    return (f1_fg + f1_bg) / 2
+
+
+def balanced_iou_score(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    """
+    Compute balanced IoU score for binary classification using PyTorch tensors.
+    Calculates IoU for background (label==0) and foreground (label==1), then averages.
+
+    Args:
+        y_true (torch.Tensor): Ground truth labels (0 or 1), shape (N,)
+        y_pred (torch.Tensor): Predicted scores/probabilities or labels, shape (N,)
+    Returns:
+        float: Balanced IoU score
+    """
+    y_true = (y_true > 0.5).long()
+    y_pred = (y_pred > 0.5).long()
+
+    # Foreground IoU (label==1)
+    intersection_fg = ((y_true == 1) & (y_pred == 1)).sum().item()
+    union_fg = ((y_true == 1) | (y_pred == 1)).sum().item()
+    iou_fg = intersection_fg / union_fg if union_fg > 0 else 0.0
+
+    # Background IoU (label==0)
+    intersection_bg = ((y_true == 0) & (y_pred == 0)).sum().item()
+    union_bg = ((y_true == 0) | (y_pred == 0)).sum().item()
+    iou_bg = intersection_bg / union_bg if union_bg > 0 else 0.0
+
+    return (iou_fg + iou_bg) / 2
+
+
 def f1_score(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
     """
     Compute F1 score for binary classification using PyTorch tensors.
@@ -19,6 +80,13 @@ def f1_score(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
     # # If predictions are probabilities, apply threshold
     # if y_pred.dtype != torch.long and y_pred.dtype != torch.int:
     #     y_pred = (y_pred >= threshold).long()
+
+    y_true = (y_true > 0.5).long()
+    y_pred = (y_pred > 0.5).long()
+
+    # print("y_true unique:", torch.unique(y_true, return_counts=True))
+    # print("y_pred unique:", torch.unique(y_pred, return_counts=True))
+    # print(y_true.shape, y_pred.shape)
 
     tp = (y_true * y_pred).sum().item()
     fp = ((1 - y_true) * y_pred).sum().item()

@@ -78,7 +78,7 @@ def create_lv_stacked(snapshot_path, volume_type="segmentation", array_name="raw
     return neuroglancer.LocalVolume(dask_arrs, dimensions=dims, volume_type=volume_type, voxel_offset=voxel_offset)
 
 
-if __name__ == "__main__":
+def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("snapshot_path", type=str)
     ap.add_argument("--add_time", action="store_true")
@@ -95,3 +95,7 @@ if __name__ == "__main__":
         signal = input("Enter q to exit: ")
         if "Q" in signal.upper():
             break
+
+
+if __name__ == "__main__":
+    main()

@@ -59,6 +59,7 @@ def run(
     output_size=gp.Coordinate((56, 56, 56)),
     distance_sigma=None,
     lsd_sigma=None,
+    model_input_key="input",
 ):
     input_size = gp.Coordinate(input_size) * gp.Coordinate(voxel_size)
     output_size = gp.Coordinate(output_size) * gp.Coordinate(voxel_size)
@@ -88,6 +89,7 @@ def run(
         min_mask=min_mask,
         distance_sigma=distance_sigma,
         lsd_sigma=lsd_sigma,
+        model_input_key=model_input_key,
     )
 
     request = gp.BatchRequest()
