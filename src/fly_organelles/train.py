@@ -13,7 +13,7 @@ from fly_organelles.model import MaskedMultiLabelBCEwithLogits, WeightedMSELoss,
 
 # from lsd.train.gp import AddLocalShapeDescriptor
 
-from fly_organelles.utils import ShiftNorm, Binarize, Distance
+from fly_organelles.utils import ShiftNorm, Binarize, Distance, EdgeDistance
 from fly_organelles.lsds.gp_node import LSDAffinities
 
 logger = logging.getLogger("__name__")
@@ -130,6 +130,7 @@ def make_data_pipeline(
     batch_size: int = 5,
     min_mask: float = None,
     distance_sigma: float = None,
+    edges_sigma: dict = None,
 ):
     raw = gp.ArrayKey("RAW")
     all_labels_key = gp.ArrayKey("LABELS")
@@ -157,7 +158,9 @@ def make_data_pipeline(
             logging.debug(f"Padding {crop} with {src.padding}")
             for label_key in label_keys.values():
                 # src_pipe += gp.AsType(label_key, "float32")
-                if distance_sigma is None:
+                if edges_sigma is not None:
+                    src_pipe += EdgeDistance(label_key, distance_sigma=edges_sigma["distance_sigma"], dilation_radius=edges_sigma["dilation_radius"])
+                elif distance_sigma is None:
                     src_pipe += Binarize(label_key)
                 else:
                     src_pipe += Distance(label_key, sigma=distance_sigma)
@@ -226,6 +229,7 @@ def make_train_pipeline(
     min_mask=None,
     distance_sigma=None,
     lsd_sigma=None,
+    edges_sigma=None,
 ):
     if affinities:
         pipeline = make_affinities_data_pipeline(
@@ -253,6 +257,7 @@ def make_train_pipeline(
             batch_size,
             min_mask=min_mask,
             distance_sigma=distance_sigma,
+            edges_sigma=edges_sigma,
         )
 
         loss_fn = BinarySegmentationLoss()

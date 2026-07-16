@@ -8,9 +8,9 @@ import edt
 import gunpowder as gp
 import numpy as np
 import yaml
-
+from skimage import filters
 import logging
-
+from skimage import morphology
 logger = logging.getLogger(__name__)
 
 # def corner_offset(center_off_arr, raw_res_arr, crop_res_arr):
@@ -239,6 +239,42 @@ class Distance(gp.BatchFilter):
 
         return outputs
 
+
+class EdgeDistance(gp.BatchFilter):
+
+    def __init__(self, array, distance_sigma=50.0,dilation_radius=3):
+        self.array = array
+        self.distance_sigma = distance_sigma
+        self.dilation_radius = dilation_radius
+
+    def setup(self):
+        spec = self.spec[self.array].copy()
+        spec.dtype = "float32"
+        self.updates(self.array, spec)
+        self.enable_autoskip()
+
+    def process(self, batch, request):
+        source = batch.arrays[self.array]
+        source_data = source.data
+        # detect edges
+        edges = filters.sobel(source_data)
+        # dilate edges
+        dilated_edges = morphology.dilation(edges, morphology.ball(self.dilation_radius))
+        # compute distance transform
+        source_data = np.tanh((edt(dilated_edges) - edt(dilated_edges == 0)) / self.distance_sigma)
+        source_data = (source_data + 1) / 2
+
+        cast_data = source_data.astype("float32")
+
+        target_spec = source.spec.copy()
+        target_spec.dtype = cast_data.dtype
+        target_array = Array(cast_data, target_spec)
+
+        # create output array
+        outputs = Batch()
+        outputs.arrays[self.array] = target_array
+
+        return outputs
 
 class Binarize(BatchFilter):
     def __init__(self, array):

@@ -23,12 +23,13 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
+  # "lsd-lite@git+https://github.com/neptunes5thmoon/lsd-lite.git",
   "daisy",
   "fibsem-tools>=6.0",
   "matplotlib",
   "funlib.learn.torch@git+https://github.com/funkelab/funlib.learn.torch.git",
   "gunpowder",
-  "corditea@git+https://github.com/saalfeldlab/corditea.git",
+  "corditea @ git+https://github.com/saalfeldlab/corditea.git@de299992d0373f4b24e0cf592df867078f31136c",
   "torch",
   "click",
   "xarray==2023.12.0",
