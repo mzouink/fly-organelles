@@ -256,6 +256,8 @@ class EdgeDistance(gp.BatchFilter):
     def process(self, batch, request):
         source = batch.arrays[self.array]
         source_data = source.data
+        # binarize
+        source_data = (source_data > 0).astype(np.float32)
         # detect edges
         edges = filters.sobel(source_data)
         # dilate edges
